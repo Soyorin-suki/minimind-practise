@@ -1,5 +1,5 @@
 
-from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 
@@ -82,11 +82,12 @@ class MyModelConfig(PretrainedConfig):
 #			model             #
 ###############################
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
 
 
 
@@ -493,8 +494,75 @@ class MyModelModel(nn.Module):
 		return hidden_states, presents
 
 
-		
 
+
+# Causal Langruage Model 因果语言模型
+# PreTrainedModel 是 nn.Model 的增强版，继承之后拥有了 save_pretrained() 以及 from_pretrained() 方法
+# 可以像加载官方 Llama 模型一样读写权重和配置
+# GenerationMixin 给予了 generate() 方法，实现 forward() 方法后，自动处理 beam search 等
+class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
+	config_class = MyModelConfig
+
+	def __init__(
+		self,
+		config: MyModelConfig
+	):
+		self.config = config
+		super().__init__(config)
+		self.model = MyModelModel(config)
+
+		# laugrage model head
+		# 负责将隐藏层的特征向量映射到词表大小
+		self.lm_head = nn.Linear(
+			self.config.hidden_size,
+			self.config.vocab_size,
+			bias=False
+		)
+
+		# 权重共享
+		# 输出层的权重与嵌入层的权重共享
+		# 避免多计算一个 weight, 在计算时更加简单
+		self.model.embed_tokens.weight = self.lm_head.weight
+		
+		# 这是一个结果容器
+		self.OUT = CausalLMOutputWithPast()
+	
+	def forward(
+		self,
+		input_ids: Optional[torch.Tensor] = None,
+		attention_mask: Optional[torch.Tensor] = None,
+		past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+		use_cache: bool = False,
+		logits_to_keep: Union[int, torch.Tensor] = 0,		# 保存多少位的 logits
+		**args
+	):
+		
+		hidden_states, past_key_values = self.model(
+			input_ids = input_ids,
+			attention_mask = attention_mask,
+			past_key_values = past_key_values,
+			use_cache = use_cache,
+			**args
+		)
+
+		# logits 一般指的是 SoftMax 前的原始输出值
+		# 如果 logits to keep 是整数，那就保留最后 n 个位置
+		# 生成的时候只使用最后的 logits 来预测下一个 token
+		slice_indices = (
+			slice(-logits_to_keep, None)
+			if isinstance(logits_to_keep, int)
+			else logits_to_keep
+		)
+		logits = self.lm_head(hidden_states[:,slice_indices, :])
+
+		# 这相当于是给字典赋值
+		self.OUT.__setitem__("last_hidden_state", hidden_states)
+		self.OUT.__setitem__("logits", logits)
+		self.OUT.__setitem__("past_key_values", past_key_values)
+
+		return self.OUT
+		
+		
 
 
 
