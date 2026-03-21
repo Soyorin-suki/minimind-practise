@@ -1,6 +1,5 @@
 
-from transformers.modeling_outputs import CausalLMOutputWithPast
-
+from transformers import PretrainedConfig
 
 
 
@@ -87,7 +86,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
-from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 
@@ -323,7 +323,10 @@ class Attention(nn.Module):
 			repeat_kv(xv, self.n_rep).transpose(1,2)
 		)
 
-		if self.flash and (seq_len>1) and (past_key_values is None) and (attention_mask is None or torch.all(attention_mask==1)):
+		if (self.flash 
+	  		and (seq_len>1) 
+			and (past_key_values is None) 
+			and (attention_mask is None or torch.all(attention_mask==1))):
 			# 如果有 CUDA 加速的话采用对应的算子
 			output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
 		else :
@@ -423,6 +426,7 @@ class MyModelModel(nn.Module):
 		self,
 		config: MyModelConfig
 	):
+		self.config = config
 		super().__init__()
 		self.vocab_size, self.num_hidden_layer = (
 			config.vocab_size,
@@ -479,11 +483,11 @@ class MyModelModel(nn.Module):
 		)
 
 		presents = []
-		for layer_idx, (layer, past_key_values) in enumerate(zip(self.layers, past_key_values)):
+		for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
 			hidden_states, present = layer(
 				hidden_states,
 				position_embeddings,
-				past_key_values = past_key_values,
+				past_key_values = past_key_value,
 				use_cache = use_cache,
 				attention_mask = attention_mask
 			)
@@ -524,8 +528,6 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 		# 避免多计算一个 weight, 在计算时更加简单
 		self.model.embed_tokens.weight = self.lm_head.weight
 		
-		# 这是一个结果容器
-		self.OUT = CausalLMOutputWithPast()
 	
 	def forward(
 		self,
@@ -555,12 +557,11 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 		)
 		logits = self.lm_head(hidden_states[:,slice_indices, :])
 
-		# 这相当于是给字典赋值
-		self.OUT.__setitem__("last_hidden_state", hidden_states)
-		self.OUT.__setitem__("logits", logits)
-		self.OUT.__setitem__("past_key_values", past_key_values)
-
-		return self.OUT
+		return CausalLMOutputWithPast(
+			logits=logits,
+			past_key_values=past_key_values,
+			hidden_states=hidden_states
+		)
 		
 		
 
