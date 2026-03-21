@@ -43,8 +43,11 @@ class PretrainDataset(Dataset):
 		tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
 		# 补全长度为 max_length
 		input_ids = tokens + [self.tokenizer.pad_token_id]*(self.max_length - len(tokens))
+		# 将其转为张量
 		input_ids = torch.tensor(input_ids, dtype=torch.long)
 
+		# labels 与 input_ids 完全相同，但是 PAD 位置设为 -100,
+		# CrossEntroyLoss 会默认忽略 -100, 不计入 loss
 		labels = input_ids.clone()
 		labels[labels == self.tokenizer.pad_token_id] = -100
 		attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
