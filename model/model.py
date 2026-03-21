@@ -1,5 +1,5 @@
 
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
 
 
 
@@ -194,7 +194,7 @@ def precompute_freqs_cis(
 		freq_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
 		freq_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
-		return freq_cos, freq_sin
+	return freq_cos, freq_sin
 
 
 # 预处理 RoPE / YaRN位置编码
@@ -357,13 +357,19 @@ class FeedForward(nn.Module):
 	):
 		super().__init__()
 		if args.intermediate_size is None:
+			# 一般的工程实践中发现 8/3 倍比较好
 			intermediate_size = int(args.hidden_size * 8 / 3)
+			# 向上取整，设为 64 的整数倍
 			args.intermediate_size = 64 * ((intermediate_size+64-1)//64)
 
+		# 升维矩阵
 		self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+		# 降维矩阵
 		self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+		# 激活所用的门矩阵
 		self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 		self.dropout = nn.Dropout(args.dropout)
+		# 激活函数 activate function
 		self.act_fn = ACT2FN[args.hidden_act]
 
 	def forward(self, x: torch.Tensor):
@@ -371,7 +377,7 @@ class FeedForward(nn.Module):
 
 
 
-class MyModelBolck(nn.Module):
+class MyModelBlock(nn.Module):
 	def __init__(
 		self,
 		layer_id: int,
@@ -411,9 +417,84 @@ class MyModelBolck(nn.Module):
 		return hidden_status, present_key_value
 
 
+class MyModelModel(nn.Module):
+	def __init__(
+		self,
+		config: MyModelConfig
+	):
+		super().__init__()
+		self.vocab_size, self.num_hidden_layer = (
+			config.vocab_size,
+			config.num_hidden_layers
+		)
+
+		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+		self.dropout = nn.Dropout(config.dropout)
+
+		self.layers = nn.ModuleList(
+			[MyModelBlock(i,config) for i in range(self.num_hidden_layer)]
+		)
+
+		self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+		# RoPE 预计算
+		freqs_cos, freqs_sin = precompute_freqs_cis(
+			dim= config.hidden_size // config.num_attention_heads,
+			end= config.max_position_embeddings,
+			rope_base= config.rope_theta,
+			rope_scaling= config.rope_scaling,
+		)
+
+		# 这是一个不需要计算梯度等的常量
+		# 直接将其存入内存中，会随GPU切换时切换
+		self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+		self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+	def forward(
+		self,
+		input_ids: Optional[torch.Tensor] = None,
+		attention_mask: Optional[torch.Tensor] = None,
+		past_key_values: Optional[torch.Tensor] = None,
+		use_cache: bool = False,
+		**kwargs
+	):
+		batch_size, seq_len = input_ids.shape
+
+		# 这是一个 hugging face 数据格式相关的代码，暂时不太需要管
+		if hasattr(past_key_values, "layers"):
+			past_key_values = None
+		past_key_values = past_key_values or [None]*len(self.layers)
+		
+		start_pos = (
+			past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+		)
+
+		hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+		position_embeddings = (
+			self.freqs_cos[start_pos:start_pos+seq_len],
+			self.freqs_sin[start_pos:start_pos+seq_len]
+		)
+
+		presents = []
+		for layer_idx, (layer, past_key_values) in enumerate(zip(self.layers, past_key_values)):
+			hidden_states, present = layer(
+				hidden_states,
+				position_embeddings,
+				past_key_values = past_key_values,
+				use_cache = use_cache,
+				attention_mask = attention_mask
+			)
+			presents.append(present)
+
+		hidden_states = self.norm(hidden_states)
+
+		return hidden_states, presents
 
 
 		
+
 
 
 
