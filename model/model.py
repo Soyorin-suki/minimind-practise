@@ -371,6 +371,46 @@ class FeedForward(nn.Module):
 
 
 
+class MyModelBolck(nn.Module):
+	def __init__(
+		self,
+		layer_id: int,
+		config: MyModelConfig
+	):
+		super().__init__()
+		self.num_attention_heads = config.num_attention_heads
+		self.hidden_size = config.hidden_size
+		self.head_dim = config.hidden_size // self.num_attention_heads
+		self.self_attn = Attention(config)
+
+		self.layer_id = layer_id
+		self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		# MLP multi-layer perceptron 多层感知机
+		# 是 前馈神经网络的同义词
+		self.mlp = FeedForward(config)
+
+	def forward(
+		self,
+		hidden_status,
+		position_embeddings,
+		past_key_value = None,
+		use_cache = False,
+		attention_mask = None
+	):
+		residual = hidden_status
+		hidden_status, present_key_value = self.self_attn(
+			self.input_layernorm(hidden_status),
+			position_embeddings,
+			past_key_value,
+			use_cache,
+			attention_mask
+		)
+		hidden_status += residual
+		hidden_status = hidden_status + self.mlp(self.post_attention_layernorm(hidden_status))
+		return hidden_status, present_key_value
+
+
 
 
 		
