@@ -28,9 +28,9 @@ import torch.nn as nn
 # t = t.transpose(0,1)
 # print(t)
 
-x = torch.Tensor([[1,2,3],[4,5,6],[7,8,9]])
-print(torch.triu(x))
-# 掩码，将(0,0)对角线以下的全部置为0
-print(torch.triu(x,diagonal=1))
-# 将(0,1)对角线以下的位置全部置为0
+# x = torch.Tensor([[1,2,3],[4,5,6],[7,8,9]])
+# print(torch.triu(x))
+# # 掩码，将(0,0)对角线以下的全部置为0
+# print(torch.triu(x,diagonal=1))
+# # 将(0,1)对角线以下的位置全部置为0
 
