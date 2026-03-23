@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 
 
 class MyModelConfig(PretrainedConfig):
-	model_type = "mymodel"
+	model_type = "minimind"
 
 	def __init__(
 		self,
@@ -186,14 +186,15 @@ def precompute_freqs_cis(
 			# 当ramp=1时（低频）： 系数为 1/factor， 对原频率进行线性插值缩放
 			# 当ramp在0-1之间时： 平滑过渡
 			freqs = freqs * (1 - ramp + ramp / factor)
-		# 根据end，生成位置索引t
-		t = torch.arange(end, device=freqs.device).float()
 
-		# 计算外积， 将t与频率部分相乘， 得到各个位置的旋转角度
-		freqs = torch.outer(t, freqs).float()
-		# 乘上缩放系数，保证注意力
-		freq_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-		freq_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+	# 根据end，生成位置索引t
+	t = torch.arange(end, device=freqs.device).float()
+
+	# 计算外积， 将t与频率部分相乘， 得到各个位置的旋转角度
+	freqs = torch.outer(t, freqs).float()
+	# 乘上缩放系数，保证注意力
+	freq_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+	freq_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
 	return freq_cos, freq_sin
 
@@ -300,7 +301,7 @@ class Attention(nn.Module):
 		use_cache: bool = False,
 		attention_mask: Optional[torch.Tensor] = None
 	):
-		bsz, seq_len = x.shape
+		bsz, seq_len, _ = x.shape
 		xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 		xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
 		xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
@@ -404,7 +405,7 @@ class MyModelBlock(nn.Module):
 		self,
 		hidden_status,
 		position_embeddings,
-		past_key_value = None,
+		past_key_values = None,
 		use_cache = False,
 		attention_mask = None
 	):
@@ -412,7 +413,7 @@ class MyModelBlock(nn.Module):
 		hidden_status, present_key_value = self.self_attn(
 			self.input_layernorm(hidden_status),
 			position_embeddings,
-			past_key_value,
+			past_key_values,
 			use_cache,
 			attention_mask
 		)
@@ -533,6 +534,7 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 		self,
 		input_ids: Optional[torch.Tensor] = None,
 		attention_mask: Optional[torch.Tensor] = None,
+		labels: Optional[torch.Tensor] = None,
 		past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 		use_cache: bool = False,
 		logits_to_keep: Union[int, torch.Tensor] = 0,		# 保存多少位的 logits
@@ -556,8 +558,18 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 			else logits_to_keep
 		)
 		logits = self.lm_head(hidden_states[:,slice_indices, :])
+		loss = None
+		if labels is not None:
+			shift_logits = logits[..., :-1, :].contiguous()
+			shift_labels = labels[..., 1:].contiguous()
+			loss = F.cross_entropy(
+				shift_logits.view(-1, shift_logits.size(-1)),
+				shift_labels.view(-1),
+				ignore_index=-100,
+			)
 
 		return CausalLMOutputWithPast(
+			loss=loss,
 			logits=logits,
 			past_key_values=past_key_values,
 			hidden_states=hidden_states

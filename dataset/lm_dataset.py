@@ -34,7 +34,7 @@ class PretrainDataset(Dataset):
 		sample = self.samples[index]
 		tokens = self.tokenizer(
 			str(sample["text"]),
-			add_special_token = False,
+			add_special_tokens = False,
 			max_length = self.max_length-2, 	# 给 BOS 和 EOS 留出位置
 			truncation = True					# 如果长度超出了 max, 自动剪切
 			).input_ids
