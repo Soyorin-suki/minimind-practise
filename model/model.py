@@ -84,6 +84,7 @@ import math
 from typing import Tuple, Optional, Union
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers import GenerationMixin, PreTrainedModel
@@ -199,7 +200,7 @@ def precompute_freqs_cis(
 	return freq_cos, freq_sin
 
 
-# 预处理 RoPE / YaRN位置编码
+# 应用 RoPE / YaRN 位置编码
 def apply_rotary_pos_emb(
 		q:torch.Tensor, 
 		k:torch.Tensor, 
@@ -382,6 +383,208 @@ class FeedForward(nn.Module):
 
 
 
+
+class MoEGate(nn.Module):
+
+	def __init__(
+		self,
+		config: MyModelConfig
+	):
+		super().__init__()
+		self.config = config
+		# 设置选择的专家的数量
+		self.top_k = config.num_experts_per_tok
+		# 设置一共有多少个专家
+		self.n_routed_experts = config.n_routed_experts
+
+		# 设置计算每个 token 对各个 专家 的打分函数 （使用 dot-product/linear+softmax）
+		self.scoring_func = config.scoring_func
+		# 设置 辅助负载均衡损失的 参数 alpha
+		# 用于控制该辅助损失的权重
+		self.alpha = config.aux_loss_alpha
+		# 设置是否采用 序列级辅助损失 否则使用 批级辅助损失
+		self.seq_aux = config.seq_aux
+
+		# 设置是否对选出的 top-k 专家的概率进行重新归一化（使其和为1）
+		self.norm_topk_prob = config.norm_topk_prob
+		# 路由 gating 输入的维度，应该等于隐藏层的维度
+		self.gating_dim = config.hidden_size
+		# 路由的矩阵，这里是形状为 (n_routed_experts, gating_dim)
+		self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+		# 重置参数
+		self.reset_parameters()
+	
+	def reset_parameters(self)->None:
+		# 这里是调用 何凯明 的初始化矩阵方法，这里的 a=\sqrt 5 是一个经验参数
+		init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+	def forward(
+		self,
+		hidden_states: torch.Tensor	# 应该是 (batch, seq, hidden_size)
+	):
+		bsz, seq_len, h = hidden_states.shape
+		# 将 hidden_states 的形状由 (batch, seq, hidden_size) 变成了 (batch*seq, hidden_size) 
+		# 便于之后进行
+		hidden_states = hidden_states.view(-1,h)
+		# logits = x*W^T 计算每个 token 对每个 expert 的打分
+		# 变成了 (batch*seq, num_expert)
+		logits = F.linear(hidden_states, self.weight, None)
+		if self.scoring_func == 'softmax':
+			# 将原始的 logits 概率化
+			scores = logits.softmax(dim=-1)
+		else:
+			raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+		
+		# topk_weight 是 (batch*seq, k) 表示每一个bacth中的每一个token对所有n_routed_experts 的概率中前k个
+		# topk_idx 是对应的下标
+		topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+		
+		# 是否需要归一化
+		if self.top_k > 1 and self.norm_topk_prob:
+			denominator = topk_weight.sum(dim=-1,keepdim=True)+ 1e-20
+			topk_weight = topk_weight/denominator
+		
+		# 如果是训练模式
+		if self.training and self.alpha>0.0:
+			# (batch*seq, num_expert)
+			scores_for_aux = scores
+			# 计算 aux 时选择的 topk
+			aux_topk = self.top_k
+			# (batch, seq*num_expert)
+			# 统计每个 batch 内，每个 token 被分到了哪个 expert
+			topk_idx_for_aux_loss = topk_idx.view(bsz,-1)
+
+			# 如果采用 序列级辅助损失函数
+			if self.seq_aux:
+				# (batch, seq, num_expert)
+				scores_for_seq_aux = scores_for_aux.view(bsz,seq_len,-1)
+				# (batch, num_expert) 
+				# 计数器，计数每一个 batch 的每一个 num_expert 都被选择了几次
+				ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+				# ce = ce * (e/(s*k))
+				# 这里直接一步计算了，先是累加，之后原地除 seq*top_k/num_expert
+				# 如果完全均匀，这里的每个值都应该是1
+				ce.scatter_add_(1, topk_idx_for_aux_loss, torch.ones(bsz, seq_len*aux_topk, device=hidden_states.device)).div_(
+					seq_len*aux_topk/self.n_routed_experts
+				)
+				# loss = \alpha* \frac{1}{batch}*\sum_{batch}\sum{i} ce_{batch,i}*P_{batch,i}
+				aux_loss = (ce*scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean()*self.alpha
+			else:
+				# 为每个 batch 的每个 token 的每个 expert 创建一个 one-hot 向量
+				# (batch*seq*num_expert, num_expert)
+				mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+				# 计算每个 expert 被选中的比例
+				# (batch*seq*num_expert, num_expert) -> (num_expert)
+				ce = mask_ce.float().mean(0)
+				# 计算每个 expert 被选中的全局比例
+				Pi = scores_for_aux.mean(0)
+				# 放大 ce ，使其均匀分布变为1
+				fi = ce*self.n_routed_experts
+				# loss = \alpha* \sum_{i}{P_i*f_i}
+				aux_loss = (Pi*fi).sum()*self.alpha
+		else :
+			# 如果没有在训练，就返回一个 (batch*seq)
+			aux_loss = scores.new_zeros(1).squeeze()
+		# 这里的 aux_loss 是一个标量
+		return topk_idx, topk_weight, aux_loss
+
+
+
+class MoEFeedForward(nn.Module):
+	def __init__(
+		self,
+		config:MyModelConfig
+	):
+		super().__init__()
+		self.config = config
+		self.experts = nn.ModuleList([
+			FeedForward(config) for _ in range(config.n_routed_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts > 0:
+			self.shared_experts = nn.ModuleList([
+				FeedForward(config) for _ in range(config.n_shared_experts)
+			])
+	
+	def forward(
+		self,
+		x: torch.Tensor
+	):
+		identity = x
+		orig_shape = x.shape
+		bsz, seq_len, h = x.shape
+		
+		topk_idx, topk_weight, aux_loss = self.gate(x)
+		topk_idx: torch.Tensor
+		topk_weight: torch.Tensor
+		# (batch*seq, hidden)
+		x = x.view(-1, x.shape[-1])
+		# (batch*seq*k)
+		flat_topk_idx = topk_idx.view(-1)
+		if self.training :
+			# (batch*seq*k, hidden)
+			x = x.repeat_interleave(self.config.num_experts_per_tok,dim=0)
+			# (batch*seq*k, hidden)
+			y = torch.empty_like(x,dtype=x.dtype)
+
+			for i,expert in enumerate(self.experts):
+				# 选中的 token 数
+				# (n_i, hidden)
+				expert_out =  expert(x[flat_topk_idx == i])
+				if expert_out.shape[0] > 0:
+					# 把结果写回原位置
+					y[flat_topk_idx == i] = expert_out.to(y.dtype)
+				else:
+					# 防止 expert 的梯度断掉
+					y[flat_topk_idx == i] = expert_out.to(y.dtype)+0*sum(p.sum() for p in expert.parameters())
+
+			# (batch*seq, hidden)*
+			y = (y.view(*topk_weight.shape,-1)*topk_weight.unsqueeze(-1)).sum(dim= 1)
+			y = y.view(*orig_shape)
+		else :
+			y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1,1)).view(
+				*orig_shape
+			)
+		
+		# 加上共享专家的
+		if self.config.n_shared_experts > 0:
+			for expert in self.shared_experts:
+				y = y + expert(identity)
+		self.aux_loss = aux_loss
+		return y
+	
+	# MoE 推理方法
+	@torch.no_grad()
+	def moe_infer(
+		self,
+		x: torch.Tensor,
+		flat_expert_indices: torch.Tensor,
+		flat_expert_weight: torch.Tensor
+	)->torch.Tensor:
+		# (batch*seq*k,hidden)
+		expert_cache = torch.zeros_like(x)
+		# 分拣
+		idxs = flat_expert_indices.argsort()
+		tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+		token_idxs = idxs//self.config.num_experts_per_tok
+		for i, end_idx in enumerate(tokens_per_expert):
+			start_idx = 0 if i == 0 else tokens_per_expert[i-1]
+			if start_idx == end_idx:
+				continue
+			expert = self.experts[i]
+			expert_token_idx = token_idxs[start_idx:end_idx]
+			expert_tokens = x[expert_token_idx]
+			expert_out = expert(expert_tokens).to(expert_cache.dtype)
+			expert_out: torch.Tensor
+			expert_out.mul_(flat_expert_weight[idxs[start_idx:end_idx]])
+			expert_cache.scatter_add_(
+				0, expert_token_idx.view(-1,1).repeat(1,x.shape[-1]),expert_out
+			)
+		return expert_cache
+		
+		
+
+
 class MyModelBlock(nn.Module):
 	def __init__(
 		self,
@@ -399,7 +602,11 @@ class MyModelBlock(nn.Module):
 		self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 		# MLP multi-layer perceptron 多层感知机
 		# 是 前馈神经网络的同义词
-		self.mlp = FeedForward(config)
+		self.mlp = (
+			FeedForward(config)
+			if not config.use_moe
+			else MoEFeedForward(config)
+		)
 
 	def forward(
 		self,
@@ -496,7 +703,15 @@ class MyModelModel(nn.Module):
 
 		hidden_states = self.norm(hidden_states)
 
-		return hidden_states, presents
+		aux_loss = sum(
+			[
+				layer.mlp.aux_loss 
+				for layer in self.layers
+				if isinstance(layer.mlp,MoEFeedForward)
+			]
+		)
+
+		return hidden_states, presents, aux_loss
 
 
 
@@ -541,7 +756,7 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 		**args
 	):
 		
-		hidden_states, past_key_values = self.model(
+		hidden_states, past_key_values, aux_loss = self.model(
 			input_ids = input_ids,
 			attention_mask = attention_mask,
 			past_key_values = past_key_values,
@@ -568,12 +783,15 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
 				ignore_index=-100,
 			)
 
-		return CausalLMOutputWithPast(
+		out_put = CausalLMOutputWithPast(
 			loss=loss,
 			logits=logits,
 			past_key_values=past_key_values,
 			hidden_states=hidden_states
 		)
+		out_put.aux_loss = aux_loss
+
+		return out_put
 		
 		
 
